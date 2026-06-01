@@ -96,7 +96,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text("❌ Telegram cannot serve this file (path unavailable). It may be too large.\n\nTry /url <direct_link> instead.")
             return
         in_path = str(ud / f"input{ext}")
-        await f.download_to_drive(custom_path=in_path, timeout=300)
+        await f.download_to_drive(custom_path=in_path)
         actual_size = os.path.getsize(in_path)
         if actual_size < 100:
             await msg.edit_text(f"❌ File too small ({actual_size} bytes). The download may have expired. Try re-sending the file immediately or use /url <direct_link>.")
@@ -134,19 +134,20 @@ async def process_text(msg, context, user_id, fname, in_path, ud):
         await msg.edit_text("❌ No text found.")
         return
 
-    pages = max(1, len(text) // 2500)
-    await msg.edit_text(f"✅ {len(text)} chars (~{pages} pages). Detecting language...")
+    pages = max(1, len(text) // 2000)
+    total_chunks = min(pages, MAX_PAGES)
+    await msg.edit_text(f"✅ {len(text)} chars (~{total_chunks} parts). Detecting language...")
 
     from langdet import detect_language
     lang = detect_language(text[:2000])
     lang_name = {"en":"English","zh":"中文","es":"Español","fr":"Français","de":"Deutsch"}.get(lang, lang)
 
     ud.clear()
-    ud.update(text=text, lang=lang, pages=pages, fname=fname, page=0, status="ready", file_size=file_size)
+    ud.update(text=text, lang=lang, pages=total_chunks, fname=fname, page=0, status="ready", file_size=file_size)
 
     keyboard = [[InlineKeyboardButton(f"📖▶️🎧 Start Reading ({lang_name})", callback_data="start")]]
     await msg.edit_text(
-        f"📖 *{fname}* ({_human_size(file_size)}) — ~{pages}p • 🌐 {lang_name}\n\nReady to read aloud!",
+        f"📖 *{fname}* ({_human_size(file_size)}) — ~{total_chunks} parts • 🌐 {lang_name}\n\nReady to read aloud!",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -218,14 +219,13 @@ async def generate_and_send(msg, context, ud):
 
         chunk_num += 1
         pct = min(99, (i - start_pos) * 100 // max(1, total_chars - start_pos))
-        from_page = (start_pos // 3000) + chunk_num
-        to_page = from_page
+        total = ud.get("pages", total_chunks)
         try:
             out = str(TMP / f"{uuid.uuid4().hex}.mp3")
             path = synthesize(chunk, lang, out)
             if path and os.path.getsize(path) > 0:
                 audio_files.append(path)
-                label = f"📖🎧 Page {from_page}-{to_page} ({pct}% of 100%)"
+                label = f"Part {chunk_num}/{total} ({pct}%)"
                 await progress_msg.edit_text(f"🎧⏳ {label}")
             else:
                 pass
@@ -273,14 +273,12 @@ async def generate_and_send(msg, context, ud):
     # Send single audio file
     await progress_msg.edit_text("✅ Done! Sending audio...")
     page_est = len(audio_files)
-    from_p = (start_pos // 3000) + 1
-    to_p = from_p + page_est - 1
-    pct_final = 100
-    btn_label = f"📖 Page {from_p}-{to_p} 🎧✅ ({pct_final}% of 100%)"
+    total = ud.get("pages", page_est)
+    btn_label = f"📖 Part 1-{page_est} 🎧✅ (100% of {total})"
     with open(final_path, "rb") as f:
         await msg.reply_audio(
             audio=f,
-            caption=f"📖 {ud.get('fname','Book')} • Page {from_p}-{to_p} • 🌐 {lang}",
+            caption=f"📖 {ud.get('fname','Book')} • {page_est} parts • 🌐 {lang}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(btn_label, callback_data="noop")],
                 [InlineKeyboardButton("📖📄 Read Along", callback_data="readalong"),
@@ -302,7 +300,7 @@ async def cmd_goto(update, context):
     try:
         p = int(context.args[0]) - 1
         ud["page"] = max(0, p)
-        await update.message.reply_text(f"🔢 Jumped to page {p+1}. Send /start to read from there.")
+        await update.message.reply_text(f"🔢 Jumped to part {p+1}. Send /start to read from there.")
     except:
         await update.message.reply_text("Usage: /goto 42")
 
@@ -311,7 +309,7 @@ async def cmd_status(update, context):
     if ud.get("text"):
         p = ud.get("page", 0) + 1
         t = ud.get("pages", "?")
-        await update.message.reply_text(f"📖 Page {p}/{t} • Status: {ud.get('status','idle')}")
+        await update.message.reply_text(f"📖 Part {p}/{t} • Status: {ud.get('status','idle')}")
     else:
         await update.message.reply_text("No active book.")
 
