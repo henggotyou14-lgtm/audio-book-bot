@@ -107,7 +107,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_text(msg, context, user.id, fname, in_path, context.user_data)
 
 async def process_text(msg, context, user_id, fname, in_path, ud):
-    await msg.edit_text("📖 Extracting text...")
+    file_size = os.path.getsize(in_path) if os.path.exists(in_path) else 0
+    await msg.edit_text(f"📖 Extracting text from {fname} ({_human_size(file_size)})...")
     try:
         text = file_to_text(in_path)
     except Exception as e:
@@ -125,11 +126,11 @@ async def process_text(msg, context, user_id, fname, in_path, ud):
     lang_name = {"en":"English","zh":"中文","es":"Español","fr":"Français","de":"Deutsch"}.get(lang, lang)
 
     ud.clear()
-    ud.update(text=text, lang=lang, pages=pages, fname=fname, page=0, status="ready")
+    ud.update(text=text, lang=lang, pages=pages, fname=fname, page=0, status="ready", file_size=file_size)
 
     keyboard = [[InlineKeyboardButton(f"📖▶️🎧 Start Reading ({lang_name})", callback_data="start")]]
     await msg.edit_text(
-        f"📖 *{fname}* — ~{pages}p • 🌐 {lang_name}\n\nReady to read aloud!",
+        f"📖 *{fname}* ({_human_size(file_size)}) — ~{pages}p • 🌐 {lang_name}\n\nReady to read aloud!",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -344,6 +345,12 @@ async def cmd_lang(update, context):
 
 async def error_handler(update, context):
     log.error(f"Error: {context.error}")
+
+def _human_size(size):
+    for u in ("B","KB","MB","GB"):
+        if size < 1024: return f"{size:.0f}{u}"
+        size /= 1024
+    return f"{size:.0f}TB"
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
