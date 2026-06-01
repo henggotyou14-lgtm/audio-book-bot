@@ -1,0 +1,10 @@
+tmp/
+__pycache__/
+*.pyc
+.env
+auth_info/
+*.mp3
+*.wav
+*.pdf
+*.docx
+.DS_Store
