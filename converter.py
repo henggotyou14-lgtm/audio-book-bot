@@ -149,6 +149,30 @@ def _epub_to_text(path):
             return text
     except:
         pass
+    # Last resort: try local web converter API
+    try:
+        import httpx
+        with open(path, 'rb') as f:
+            resp = httpx.post('http://localhost:8077/', files={'file': (os.path.basename(path), f, 'application/epub+zip')}, data={'type': 'epub2txt'}, timeout=120)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get('job_id'):
+                import time
+                for _ in range(60):
+                    time.sleep(2)
+                    presp = httpx.get(f'http://localhost:8077/progress/{data["job_id"]}', timeout=10)
+                    pdata = presp.json()
+                    if pdata.get('status') == 'done' and pdata.get('result'):
+                        dl = pdata['result'].get('download_url', '')
+                        if dl:
+                            r = httpx.get(f'http://localhost:8077{dl}', timeout=30)
+                            text = r.text
+                            if len(text) > 100:
+                                return text
+                    elif pdata.get('status') == 'error':
+                        break
+    except Exception as e:
+        log.warning(f"web converter fallback failed: {e}")
     raise ValueError("Could not extract text from EPUB. The file may be corrupted or DRM-protected.")
 
 def _docx_to_text(path):

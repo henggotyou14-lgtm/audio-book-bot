@@ -92,14 +92,24 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         f = await context.bot.get_file(file_id)
         in_path = str(ud / f"input{ext}")
-        # Use httpx streaming download for large files
         import httpx
         url = f"https://api.telegram.org/file/bot{TOKEN}/{f.file_path}"
-        async with httpx.AsyncClient(timeout=120) as client:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
             async with client.stream("GET", url) as r:
+                if r.status_code != 200:
+                    err_body = await r.aread()
+                    await msg.edit_text(f"❌ Download failed (HTTP {r.status_code}): {err_body[:200].decode(errors='replace')}")
+                    return
                 with open(in_path, "wb") as fp:
                     async for chunk in r.aiter_bytes(65536):
                         fp.write(chunk)
+        # Verify the download
+        actual_size = os.path.getsize(in_path)
+        if actual_size < 100:
+            with open(in_path, 'r', errors='replace') as fp:
+                content = fp.read(200)
+            await msg.edit_text(f"❌ Download incomplete ({actual_size} bytes). The Telegram API may be blocking large file access.\n\nTry /url <direct_link> instead. Response: {content[:100]}")
+            return
     except Exception as e:
         await msg.edit_text(f"❌ Download failed: {e}")
         return
@@ -109,10 +119,25 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_text(msg, context, user_id, fname, in_path, ud):
     file_size = os.path.getsize(in_path) if os.path.exists(in_path) else 0
     await msg.edit_text(f"📖 Extracting text from {fname} ({_human_size(file_size)})...")
+    # Quick integrity check
+    if file_size < 100:
+        await msg.edit_text(f"❌ File too small ({file_size} bytes). The download may have failed. Try using /url <direct_link> instead.")
+        return
+    with open(in_path, 'rb') as f:
+        magic = f.read(4)
+    if magic[:2] == b'PK':
+        import zipfile
+        try:
+            with zipfile.ZipFile(in_path) as z:
+                pass
+        except zipfile.BadZipFile:
+            await msg.edit_text("❌ File appears to be damaged (invalid ZIP/EPUB). Try re-downloading or use /url <direct_link>.")
+            return
     try:
         text = file_to_text(in_path)
     except Exception as e:
-        await msg.edit_text(f"❌ Could not read file: {e}")
+        err = str(e)
+        await msg.edit_text(f"❌ Could not read file: {err}\n\nTry using /url <direct_link> or convert via https://macmac-mini.tail926eff.ts.net/convert first.")
         return
     if not text.strip():
         await msg.edit_text("❌ No text found.")
