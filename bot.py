@@ -91,27 +91,18 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("📥 Downloading...")
     try:
         f = await context.bot.get_file(file_id)
+        log.info(f"Got file: {f.file_id}, size: {f.file_size}, path: {f.file_path}")
+        if not f.file_path:
+            await msg.edit_text("❌ Telegram cannot serve this file (path unavailable). It may be too large.\n\nTry /url <direct_link> instead.")
+            return
         in_path = str(ud / f"input{ext}")
-        import httpx
-        url = f"https://api.telegram.org/file/bot{TOKEN}/{f.file_path}"
-        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-            async with client.stream("GET", url) as r:
-                if r.status_code != 200:
-                    err_body = await r.aread()
-                    await msg.edit_text(f"❌ Download failed (HTTP {r.status_code}): {err_body[:200].decode(errors='replace')}")
-                    return
-                with open(in_path, "wb") as fp:
-                    async for chunk in r.aiter_bytes(65536):
-                        fp.write(chunk)
-        # Verify the download
+        await f.download_to_drive(custom_path=in_path, timeout=300)
         actual_size = os.path.getsize(in_path)
         if actual_size < 100:
-            with open(in_path, 'r', errors='replace') as fp:
-                content = fp.read(200)
-            await msg.edit_text(f"❌ Download incomplete ({actual_size} bytes). The Telegram API may be blocking large file access.\n\nTry /url <direct_link> instead. Response: {content[:100]}")
+            await msg.edit_text(f"❌ File too small ({actual_size} bytes). The download may have expired. Try re-sending the file immediately or use /url <direct_link>.")
             return
     except Exception as e:
-        await msg.edit_text(f"❌ Download failed: {e}")
+        await msg.edit_text(f"❌ Download failed: {e}\n\nThe file may be too large for Telegram's bot API (20MB limit). Try /url <direct_link> instead.")
         return
 
     await process_text(msg, context, user.id, fname, in_path, context.user_data)
