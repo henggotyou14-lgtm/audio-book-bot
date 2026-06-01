@@ -94,6 +94,37 @@ def _epub_to_text(path):
     except Exception as e:
         log.warning(f"fitz epub failed: {e}")
     try:
+        import ebooklib
+        from ebooklib import epub
+        book = epub.read_epub(path)
+        texts = []
+        for item in book.get_items():
+            if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                content = item.get_body_content().decode('utf-8', errors='replace')
+                texts.append(content)
+        if texts:
+            from html.parser import HTMLParser
+            class TextExtractor(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.text = []
+                    self.skip = False
+                def handle_starttag(self, tag, attrs):
+                    if tag in ('script', 'style'): self.skip = True
+                def handle_endtag(self, tag):
+                    if tag in ('script', 'style'): self.skip = False
+                def handle_data(self, data):
+                    if not self.skip: self.text.append(data)
+            parser = TextExtractor()
+            result = []
+            for t in texts:
+                parser.text = []
+                parser.feed(t)
+                result.append(''.join(parser.text))
+            return '\n'.join(result)
+    except Exception as e:
+        log.warning(f"ebooklib failed: {e}")
+    try:
         import xml.etree.ElementTree as ET
         with zipfile.ZipFile(path) as z:
             texts = []
@@ -110,6 +141,14 @@ def _epub_to_text(path):
         log.warning("Not a valid zip file")
     except Exception as e:
         log.warning(f"zip parse error: {e}")
+    # Last resort: try reading as plain text
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+        if len(text) > 100:
+            return text
+    except:
+        pass
     raise ValueError("Could not extract text from EPUB. The file may be corrupted or DRM-protected.")
 
 def _docx_to_text(path):
