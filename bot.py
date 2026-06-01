@@ -1,8 +1,8 @@
 """
-@HengAudioBKBot — Telegram e-book to audiobook converter.
-Reads PDF, EPUB, DOCX, TXT, images aloud with language detection + TTS.
+@HengAudioBKBot — reads e-books aloud. Clean single-audio interface.
+Generates one MP3 per session, progress updates via editable message.
 """
-import os, sys, json, time, asyncio, re, html, uuid, logging
+import os, sys, json, time, asyncio, uuid, logging, tempfile, subprocess
 from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
@@ -17,260 +17,345 @@ if not TOKEN:
     log.error("Set AUDIO_BOOK_TOKEN environment variable")
     sys.exit(1)
 
-DATA_DIR = Path(__file__).parent / "data"
-TMP_DIR = Path(__file__).parent / "tmp"
-DATA_DIR.mkdir(exist_ok=True)
-TMP_DIR.mkdir(exist_ok=True)
+TMP = Path(__file__).parent / "tmp"
+TMP.mkdir(exist_ok=True)
+MAX_PAGES = 30  # max audio chunks to generate per session
+MAX_CHARS = MAX_PAGES * 3000
 
-CHUNK_SIZE = 4000
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-CACHE_TTL = 86400  # 24h
-
-def get_user_path(user_id):
-    p = TMP_DIR / str(user_id)
+def user_dir(uid):
+    p = TMP / str(uid)
     p.mkdir(exist_ok=True)
     return p
-
-def cleanup_path(p):
-    for f in p.iterdir():
-        try:
-            if time.time() - f.stat().st_mtime > CACHE_TTL:
-                f.unlink()
-        except:
-            pass
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🎧 *Audio Book Bot*\n\n"
-        "Send me an e-book file and I'll read it aloud!\n\n"
-        "Supported formats:\n"
-        "📄 PDF, 📖 EPUB, 📝 DOCX, 📃 TXT, 🖼️ Images\n\n"
-        "Commands:\n"
-        "/help — Show help\n"
-        "/status — Current session\n"
-        "/stop — Stop playback\n"
-        "/lang — Set TTS language\n"
-        "/goto <page> — Jump to page\n"
-        "/resume — Resume paused book\n\n"
-        "_Powered by gTTS + Tesseract OCR_",
+        "Send me a file (PDF, EPUB, DOCX, TXT, image) and I'll read it aloud.\n\n"
+        "• Single audio file — no spam\n"
+        "• Auto language detection\n"
+        "• Supports text + scanned PDFs (OCR)\n"
+        "• Max ~30 pages per session\n\n"
+        "/help — Commands",
         parse_mode="Markdown"
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start(update, context)
+async def help_cmd(update, context):
+    await update.message.reply_text(
+        "*/start* — Welcome\n"
+        "*/status* — Current session\n"
+        "*/stop* — Stop and clear\n"
+        "*/goto <n>* — Jump to page n\n"
+        "*/url <link>* — Read from URL (bypasses 20MB limit)\n"
+        "*/lang* — Change TTS language\n"
+        "*/convert* — Open Web Converter for ebook format conversion\n\n"
+        "📎 *Large files?* Use /url or compress at:\n"
+        "https://macmac-mini.tail926eff.ts.net/convert",
+        parse_mode="Markdown"
+    )
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    user_dir = get_user_path(user.id)
-    cleanup_path(user_dir)
+    ud = user_dir(user.id)
 
     file_id = None
-    file_name = "unknown"
+    fname = "unknown"
     if update.message.document:
         file_id = update.message.document.file_id
-        file_name = update.message.document.file_name or "document"
+        fname = update.message.document.file_name or "doc"
     elif update.message.photo:
         file_id = update.message.photo[-1].file_id
-        file_name = "photo.jpg"
+        fname = "photo.jpg"
     else:
-        await update.message.reply_text("Please send a file (PDF, EPUB, DOCX, TXT, or image).")
+        await update.message.reply_text("Send a file (PDF, EPUB, DOCX, TXT, or image).")
         return
 
-    ext = os.path.splitext(file_name)[1].lower()
-    sup = {'.pdf', '.epub', '.docx', '.txt', '.csv', '.json', '.html', '.htm',
-           '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.gif'}
-    if ext not in sup:
-        await update.message.reply_text(f"Unsupported format `{ext}`. Try PDF, EPUB, DOCX, TXT, or image.", parse_mode="Markdown")
+    ext = os.path.splitext(fname)[1].lower()
+    if ext not in ('.pdf','.epub','.docx','.txt','.csv','.json','.md','.html','.htm',
+                   '.jpg','.jpeg','.png','.tiff','.tif','.bmp','.gif'):
+        await update.message.reply_text(f"Format `{ext}` not supported. Try PDF, EPUB, DOCX, TXT, or image.", parse_mode="Markdown")
         return
 
-    msg = await update.message.reply_text("⏳ Downloading file...")
+    # Warn if file is large, but try anyway
+    file_obj = update.message.document or (update.message.photo and update.message.photo[-1])
+    if file_obj and file_obj.file_size and file_obj.file_size > 20 * 1024 * 1024:
+        keyboard = [[InlineKeyboardButton("📎 Use URL Instead", callback_data="show_url_help")]]
+        await update.message.reply_text(
+            "⚠️ File is over 20MB — Telegram bot API may reject download.\n\n"
+            "Options:\n"
+            "1. Send a direct URL with /url <link>\n"
+            "2. Upload to Web Converter at https://macmac-mini.tail926eff.ts.net/convert to shrink it, then re-send",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    msg = await update.message.reply_text("📥 Downloading...")
     try:
-        file = await context.bot.get_file(file_id)
-        in_path = str(user_dir / f"input{ext}")
-        await file.download_to_drive(in_path)
+        f = await context.bot.get_file(file_id)
+        in_path = str(ud / f"input{ext}")
+        # Use httpx streaming download for large files
+        import httpx
+        url = f"https://api.telegram.org/file/bot{TOKEN}/{f.file_path}"
+        async with httpx.AsyncClient(timeout=120) as client:
+            async with client.stream("GET", url) as r:
+                with open(in_path, "wb") as fp:
+                    async for chunk in r.aiter_bytes(65536):
+                        fp.write(chunk)
     except Exception as e:
         await msg.edit_text(f"❌ Download failed: {e}")
         return
 
+    await process_text(msg, context, user.id, fname, in_path, context.user_data)
+
+async def process_text(msg, context, user_id, fname, in_path, ud):
     await msg.edit_text("📖 Extracting text...")
     try:
         text = file_to_text(in_path)
     except Exception as e:
-        await msg.edit_text(f"❌ Text extraction failed: {e}")
+        await msg.edit_text(f"❌ Could not read file: {e}")
         return
-
     if not text.strip():
-        await msg.edit_text("❌ No text could be extracted from this file.")
+        await msg.edit_text("❌ No text found.")
         return
 
-    pages_est = max(1, len(text) // 2500)
-    await msg.edit_text(f"✅ Extracted ~{len(text)} chars (~{pages_est} pages). Detecting language...")
+    pages = max(1, len(text) // 2500)
+    await msg.edit_text(f"✅ {len(text)} chars (~{pages} pages). Detecting language...")
 
     from langdet import detect_language
     lang = detect_language(text[:2000])
-    lang_name = {"en": "English", "zh": "Chinese", "es": "Spanish", "fr": "French",
-                 "de": "German", "ja": "Japanese", "ko": "Korean", "und": "Unknown"}.get(lang, lang)
+    lang_name = {"en":"English","zh":"中文","es":"Español","fr":"Français","de":"Deutsch"}.get(lang, lang)
 
-    user_data = context.user_data
-    user_data["text"] = text
-    user_data["lang"] = lang
-    user_data["page"] = 0
-    user_data["pages"] = pages_est
-    user_data["file_name"] = file_name
-    user_data["status"] = "ready"
+    ud.clear()
+    ud.update(text=text, lang=lang, pages=pages, fname=fname, page=0, status="ready")
 
-    keyboard = [
-        [InlineKeyboardButton("▶️ Start Reading", callback_data="start_read")],
-        [InlineKeyboardButton(f"🌐 Language: {lang_name}", callback_data="change_lang")],
-    ]
-    await msg.edit_text(f"📖 *{file_name}*\n~{pages_est} pages | 🌐 {lang_name}\n\nReady to read!",
-                        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [[InlineKeyboardButton(f"📖▶️🎧 Start Reading ({lang_name})", callback_data="start")]]
+    await msg.edit_text(
+        f"📖 *{fname}* — ~{pages}p • 🌐 {lang_name}\n\nReady to read aloud!",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_data = context.user_data
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    ud = context.user_data
 
-    if data == "start_read":
-        await stream_audio(query.message, context, user_data)
-    elif data == "change_lang":
-        keyboard = [
-            [InlineKeyboardButton("English 🇬🇧", callback_data="setlang_en")],
-            [InlineKeyboardButton("Chinese 🇨🇳", callback_data="setlang_zh")],
-            [InlineKeyboardButton("Spanish 🇪🇸", callback_data="setlang_es")],
-            [InlineKeyboardButton("French 🇫🇷", callback_data="setlang_fr")],
-            [InlineKeyboardButton("German 🇩🇪", callback_data="setlang_de")],
-            [InlineKeyboardButton("Auto-detect", callback_data="setlang_auto")],
-        ]
-        await query.edit_message_text("Select TTS language:", reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data.startswith("setlang_"):
-        lang = data.replace("setlang_", "")
-        user_data["lang"] = lang
-        await query.edit_message_text(f"✅ Language set to {lang}. Send a file to begin.")
-    elif data == "pause":
-        user_data["status"] = "paused"
-        keyboard = [[InlineKeyboardButton("▶️ Resume", callback_data="resume")],
-                    [InlineKeyboardButton("⏹️ Stop", callback_data="stop")]]
-        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-    elif data == "resume":
-        user_data["status"] = "playing"
-        await stream_audio(query.message, context, user_data, resume=True)
+    if data == "start":
+        await generate_and_send(q.message, context, ud)
     elif data == "stop":
-        user_data["status"] = "stopped"
-        user_data["page"] = 0
-        await query.edit_message_text("⏹️ Playback stopped. Send a new file or type /resume.")
+        ud["status"] = "stopped"
+        await q.edit_message_text("⏹️ Stopped.")
+    elif data == "show_url_help":
+        await q.edit_message_text(
+            "📎 *URL Upload*\n\n"
+            "Instead of uploading directly, share a direct download link:\n\n"
+            "`/url https://example.com/book.pdf`\n\n"
+            "Works with PDF, EPUB, DOCX, TXT files hosted online.\n"
+            "No 20MB Telegram limit — downloads directly to server.",
+            parse_mode="Markdown"
+        )
+    elif data == "readalong":
+        text = ud.get("text", "")
+        if text:
+            txt_path = str(TMP / f"readalong_{uuid.uuid4().hex}.txt")
+            with open(txt_path, "w") as f:
+                f.write(text[:100000])
+            with open(txt_path, "rb") as f:
+                await q.message.reply_document(
+                    document=f,
+                    filename=f"{ud.get('fname','book')}.txt",
+                    caption="📖 Read along while listening. Scroll as the audio plays."
+                )
+            try: os.unlink(txt_path)
+            except: pass
+        else:
+            await q.message.reply_text("No text available.")
+    elif data == "lang_en":
+        ud["lang"] = "en"
+        await q.edit_message_text("🌐 Language: English. Send a file.")
+    elif data == "lang_zh":
+        ud["lang"] = "zh"
+        await q.edit_message_text("🌐 Language: 中文. Send a file.")
 
-async def stream_audio(message, context, user_data, resume=False):
-    text = user_data.get("text", "")
+async def generate_and_send(msg, context, ud):
+    text = ud.get("text", "")
     if not text:
-        await message.reply_text("No book loaded. Send a file first.")
+        await msg.reply_text("No book loaded.")
         return
 
-    lang = user_data.get("lang", "en")
-    user_data["status"] = "playing"
-    total = len(text)
-    start_pos = user_data.get("page", 0) * CHUNK_SIZE if resume else 0
+    lang = ud.get("lang", "en")
+    total_chars = min(len(text), MAX_CHARS)
+    start_pos = (ud.get("page", 0)) * 3000
+    ud["status"] = "generating"
+    audio_files = []
 
-    for i in range(start_pos, total, CHUNK_SIZE):
-        if user_data.get("status") != "playing":
+    progress_msg = await msg.reply_text("🎧⏳ Generating audiobook... 0% of 100%")
+
+    total_chunks = max(1, (total_chars - start_pos) // 3000 + 1)
+    chunk_num = 0
+    for i in range(start_pos, total_chars, 3000):
+        if ud.get("status") in ("stopped", "paused"):
             break
-        chunk = text[i:i + CHUNK_SIZE]
-        if not chunk.strip():
+        chunk = text[i:i+3000].strip()
+        if not chunk:
             continue
-        pct = min(100, (i + len(chunk)) * 100 // total)
-        page_num = i // CHUNK_SIZE + 1
 
-        status_text = f"📖 Page {page_num}/{user_data.get('pages', '?')} ({pct}%)"
-
+        chunk_num += 1
+        pct = min(99, (i - start_pos) * 100 // max(1, total_chars - start_pos))
+        from_page = (start_pos // 3000) + chunk_num
+        to_page = from_page
         try:
-            audio_path = synthesize(chunk, lang, str(TMP_DIR / f"{uuid.uuid4().hex}.mp3"))
-            if audio_path and os.path.exists(audio_path):
-                with open(audio_path, "rb") as f:
-                    await message.reply_audio(
-                        audio=f,
-                        caption=status_text,
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("⏸️ Pause", callback_data="pause"),
-                             InlineKeyboardButton("⏹️ Stop", callback_data="stop")],
-                            [InlineKeyboardButton("⏭️ Skip", callback_data="next")],
-                        ])
-                    )
-                os.unlink(audio_path)
-            user_data["page"] = page_num
+            out = str(TMP / f"{uuid.uuid4().hex}.mp3")
+            path = synthesize(chunk, lang, out)
+            if path and os.path.getsize(path) > 0:
+                audio_files.append(path)
+                label = f"📖🎧 Page {from_page}-{to_page} ({pct}% of 100%)"
+                await progress_msg.edit_text(f"🎧⏳ {label}")
+            else:
+                pass
         except Exception as e:
-            log.error(f"TTS error: {e}")
-            await message.reply_text(f"❌ Audio generation failed at page {page_num}: {e}")
-            break
+            log.warning(f"Chunk {i} failed: {e}")
+            continue
 
-        await asyncio.sleep(0.5)
+    if not audio_files:
+        await progress_msg.edit_text("❌ Could not generate audio.")
+        return
 
-    if user_data.get("status") == "playing":
-        user_data["status"] = "done"
-        await message.reply_text("✅ Finished reading! Send another file or /help.")
+    # Concatenate all audio files into one
+    await progress_msg.edit_text("🎧 Combining audio...")
+    final_path = str(TMP / f"book_{uuid.uuid4().hex}.mp3")
+    try:
+        list_path = str(TMP / f"list_{uuid.uuid4().hex}.txt")
+        with open(list_path, "w") as f:
+            for af in audio_files:
+                f.write(f"file '{af}'\n")
+        subprocess.run(["ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                       "-i", list_path, "-c", "copy", final_path],
+                      capture_output=True, timeout=60)
+        os.unlink(list_path)
+    except Exception as e:
+        log.warning(f"Concat failed: {e}, sending individual chunks instead")
+        await progress_msg.edit_text("✅ Done! Sending audio...")
+        for af in audio_files:
+            with open(af, "rb") as f:
+                await msg.reply_audio(audio=f)
+            try:
+                os.unlink(af)
+            except:
+                pass
+        await progress_msg.delete()
+        for af in audio_files:
+            try: os.unlink(af)
+            except: pass
+        return
 
-async def cmd_goto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = context.user_data
-    text = user_data.get("text", "")
-    if not text:
+    # Clean up chunks
+    for af in audio_files:
+        try: os.unlink(af)
+        except: pass
+
+    # Send single audio file
+    await progress_msg.edit_text("✅ Done! Sending audio...")
+    page_est = len(audio_files)
+    from_p = (start_pos // 3000) + 1
+    to_p = from_p + page_est - 1
+    pct_final = 100
+    btn_label = f"📖 Page {from_p}-{to_p} 🎧✅ ({pct_final}% of 100%)"
+    with open(final_path, "rb") as f:
+        await msg.reply_audio(
+            audio=f,
+            caption=f"📖 {ud.get('fname','Book')} • Page {from_p}-{to_p} • 🌐 {lang}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(btn_label, callback_data="noop")],
+                [InlineKeyboardButton("📖📄 Read Along", callback_data="readalong"),
+                 InlineKeyboardButton("⏹️⏸️ Stop", callback_data="stop")],
+            ])
+        )
+
+    # Cleanup final
+    try: os.unlink(final_path)
+    except: pass
+    await progress_msg.delete()
+    ud["status"] = "done"
+
+async def cmd_goto(update, context):
+    ud = context.user_data
+    if not ud.get("text"):
         await update.message.reply_text("No book loaded.")
         return
     try:
-        page = int(context.args[0]) if context.args else 0
-        user_data["page"] = max(0, min(page - 1, len(text) // CHUNK_SIZE))
-        await update.message.reply_text(f"🔢 Jumped to page {user_data['page'] + 1}. Use /resume to play.")
+        p = int(context.args[0]) - 1
+        ud["page"] = max(0, p)
+        await update.message.reply_text(f"🔢 Jumped to page {p+1}. Send /start to read from there.")
     except:
-        await update.message.reply_text("Usage: /goto <page_number>")
+        await update.message.reply_text("Usage: /goto 42")
 
-async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = context.user_data
-    if user_data.get("text"):
-        user_data["status"] = "playing"
-        msg = await update.message.reply_text("▶️ Resuming...")
-        await stream_audio(msg, context, user_data, resume=True)
-    else:
-        await update.message.reply_text("No paused book. Send a file first.")
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = context.user_data
-    if user_data.get("text"):
-        page = user_data.get("page", 0) + 1
-        total = user_data.get("pages", "?")
-        pct = min(100, page * 100 // total) if total != "?" else 0
-        await update.message.reply_text(f"📖 *Status*\nPage {page}/{total} ({pct}%)\nStatus: {user_data.get('status', 'idle')}",
-                                        parse_mode="Markdown")
+async def cmd_status(update, context):
+    ud = context.user_data
+    if ud.get("text"):
+        p = ud.get("page", 0) + 1
+        t = ud.get("pages", "?")
+        await update.message.reply_text(f"📖 Page {p}/{t} • Status: {ud.get('status','idle')}")
     else:
         await update.message.reply_text("No active book.")
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_stop(update, context):
     context.user_data["status"] = "stopped"
     await update.message.reply_text("⏹️ Stopped.")
 
-async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("English 🇬🇧", callback_data="setlang_en")],
-        [InlineKeyboardButton("Chinese 🇨🇳", callback_data="setlang_zh")],
-        [InlineKeyboardButton("Spanish 🇪🇸", callback_data="setlang_es")],
-        [InlineKeyboardButton("French 🇫🇷", callback_data="setlang_fr")],
-        [InlineKeyboardButton("German 🇩🇪", callback_data="setlang_de")],
-        [InlineKeyboardButton("Auto-detect", callback_data="setlang_auto")],
-    ]
-    await update.message.reply_text("Select TTS language:", reply_markup=InlineKeyboardMarkup(keyboard))
+async def cmd_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /url <direct_link_to_pdf_or_ebook>\n\nExample: /url https://example.com/book.pdf")
+        return
+    url = context.args[0]
+    user = update.effective_user
+    ud = user_dir(user.id)
+    msg = await update.message.reply_text("📥 Downloading from URL...")
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+            async with client.stream("GET", url) as r:
+                disp = r.headers.get("content-disposition", "")
+                fname = "document.pdf"
+                if "filename=" in disp:
+                    fname = disp.split("filename=")[-1].split(";")[0].strip('"\'')
+                elif ".pdf" in url:
+                    fname = url.split("/")[-1].split("?")[0] or "document.pdf"
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in ('.pdf','.epub','.docx','.txt','.json','.md','.html','.htm','.csv'):
+                    fname += ext if ext else '.pdf'
+                in_path = str(ud / f"input{ext}")
+                with open(in_path, "wb") as fp:
+                    async for chunk in r.aiter_bytes(65536):
+                        fp.write(chunk)
+    except Exception as e:
+        await msg.edit_text(f"❌ URL download failed: {e}")
+        return
+    # Process the downloaded file
+    context.user_data.clear()
+    context.user_data["file_path"] = in_path
+    await process_text(msg, context, user.id, fname, in_path, context.user_data)
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    log.error(f"Update {update} caused error {context.error}")
+async def cmd_lang(update, context):
+    keyboard = [
+        [InlineKeyboardButton("English", callback_data="lang_en"),
+         InlineKeyboardButton("中文", callback_data="lang_zh")],
+    ]
+    await update.message.reply_text("Select language:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def error_handler(update, context):
+    log.error(f"Error: {context.error}")
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("goto", cmd_goto))
-    app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("url", cmd_url))
     app.add_handler(CommandHandler("lang", cmd_lang))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, handle_file))
-    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(CallbackQueryHandler(callback))
     app.add_error_handler(error_handler)
     log.info("🤖 Audio Book Bot starting...")
     app.run_polling()
