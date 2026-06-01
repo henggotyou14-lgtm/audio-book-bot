@@ -19,8 +19,31 @@ if not TOKEN:
 
 TMP = Path(__file__).parent / "tmp"
 TMP.mkdir(exist_ok=True)
-MAX_PAGES = 30  # max audio chunks to generate per session
+DATA = Path(__file__).parent / "data"
+DATA.mkdir(exist_ok=True)
+SESSIONS_FILE = DATA / "sessions.json"
+
+MAX_PAGES = 30
 MAX_CHARS = MAX_PAGES * 3000
+
+def load_session(uid):
+    if SESSIONS_FILE.exists():
+        try:
+            all_s = json.loads(SESSIONS_FILE.read_text())
+            return all_s.get(str(uid), {})
+        except: return {}
+    return {}
+
+def save_session(uid, data):
+    all_s = {}
+    if SESSIONS_FILE.exists():
+        try: all_s = json.loads(SESSIONS_FILE.read_text())
+        except: pass
+    all_s[str(uid)] = {"fname": data.get("fname"), "lang": data.get("lang"),
+                       "page": data.get("page"), "pages": data.get("pages"),
+                       "status": data.get("status"), "voice": data.get("voice", "default"),
+                       "file_size": data.get("file_size"), "text_start": data.get("text","")[:100]}
+    SESSIONS_FILE.write_text(json.dumps(all_s, indent=2))
 
 def user_dir(uid):
     p = TMP / str(uid)
@@ -143,9 +166,12 @@ async def process_text(msg, context, user_id, fname, in_path, ud):
     lang_name = {"en":"English","zh":"中文","es":"Español","fr":"Français","de":"Deutsch"}.get(lang, lang)
 
     ud.clear()
-    ud.update(text=text, lang=lang, pages=total_chunks, fname=fname, page=0, status="ready", file_size=file_size)
+    ud.update(text=text, lang=lang, pages=total_chunks, fname=fname, page=0, status="ready", file_size=file_size, voice="default")
 
-    keyboard = [[InlineKeyboardButton(f"📖▶️🎧 Start Reading ({lang_name})", callback_data="start")]]
+    keyboard = [
+        [InlineKeyboardButton(f"📖▶️🎧 Start Reading ({lang_name})", callback_data="start")],
+        [InlineKeyboardButton("🎙️ Voice: Default", callback_data="voice_menu")]
+    ]
     await msg.edit_text(
         f"📖 *{fname}* ({_human_size(file_size)}) — ~{total_chunks} parts • 🌐 {lang_name}\n\nReady to read aloud!",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard)
@@ -162,6 +188,37 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "stop":
         ud["status"] = "stopped"
         await q.edit_message_text("⏹️ Stopped.")
+    elif data == "voice_menu":
+        from tts_engine import VOICES
+        rows = []
+        row = []
+        for i, (vid, vinfo) in enumerate(VOICES.items()):
+            current = ud.get("voice", "default")
+            mark = "✅" if vid == current else ""
+            row.append(InlineKeyboardButton(f"{mark}{vinfo['desc']}", callback_data=f"voice_{vid}"))
+            if len(row) >= 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_ready")])
+        await q.edit_message_text("🎙️ *Select Voice*", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    elif data.startswith("voice_"):
+        vid = data.replace("voice_", "")
+        ud["voice"] = vid
+        await q.edit_message_text(f"✅ Voice set to: {vid}. You can now start reading.", reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📖▶️🎧 Start Reading", callback_data="start")]]
+        ))
+    elif data == "back_to_ready":
+        lang_name = {"en":"English","zh":"中文"}.get(ud.get("lang","en"), ud.get("lang","en"))
+        await q.edit_message_text(
+            f"📖 *{ud.get('fname','Book')}* — ~{ud.get('pages','?')} parts • 🌐 {lang_name}\n\nReady to read aloud!",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📖▶️🎧 Start Reading ({lang_name})", callback_data="start")],
+                [InlineKeyboardButton("🎙️ Voice: " + ud.get("voice","default"), callback_data="voice_menu")],
+            ])
+        )
     elif data == "show_url_help":
         await q.edit_message_text(
             "📎 *URL Upload*\n\n"
@@ -171,22 +228,6 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "No 20MB Telegram limit — downloads directly to server.",
             parse_mode="Markdown"
         )
-    elif data == "readalong":
-        text = ud.get("text", "")
-        if text:
-            txt_path = str(TMP / f"readalong_{uuid.uuid4().hex}.txt")
-            with open(txt_path, "w") as f:
-                f.write(text[:100000])
-            with open(txt_path, "rb") as f:
-                await q.message.reply_document(
-                    document=f,
-                    filename=f"{ud.get('fname','book')}.txt",
-                    caption="📖 Read along while listening. Scroll as the audio plays."
-                )
-            try: os.unlink(txt_path)
-            except: pass
-        else:
-            await q.message.reply_text("No text available.")
     elif data == "lang_en":
         ud["lang"] = "en"
         await q.edit_message_text("🌐 Language: English. Send a file.")
@@ -201,6 +242,7 @@ async def generate_and_send(msg, context, ud):
         return
 
     lang = ud.get("lang", "en")
+    voice = ud.get("voice", "default")
     total_chars = min(len(text), MAX_CHARS)
     start_pos = (ud.get("page", 0)) * 3000
     ud["status"] = "generating"
@@ -222,7 +264,7 @@ async def generate_and_send(msg, context, ud):
         total = ud.get("pages", total_chunks)
         try:
             out = str(TMP / f"{uuid.uuid4().hex}.mp3")
-            path = synthesize(chunk, lang, out)
+            path = synthesize(chunk, lang, out, voice=voice)
             if path and os.path.getsize(path) > 0:
                 audio_files.append(path)
                 label = f"Part {chunk_num}/{total} ({pct}%)"
@@ -281,8 +323,7 @@ async def generate_and_send(msg, context, ud):
             caption=f"📖 {ud.get('fname','Book')} • {page_est} parts • 🌐 {lang}",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton(btn_label, callback_data="noop")],
-                [InlineKeyboardButton("📖📄 Read Along", callback_data="readalong"),
-                 InlineKeyboardButton("⏹️⏸️ Stop", callback_data="stop")],
+                [InlineKeyboardButton("⏹️ Stop", callback_data="stop")],
             ])
         )
 
@@ -291,6 +332,7 @@ async def generate_and_send(msg, context, ud):
     except: pass
     await progress_msg.delete()
     ud["status"] = "done"
+    # Persist session so /resume can work after restart
 
 async def cmd_goto(update, context):
     ud = context.user_data
